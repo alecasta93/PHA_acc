@@ -1,369 +1,377 @@
-# Import necessary libraries
-import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-import numpy as np
-import io, re
-from google.colab import files
-from scipy.stats import shapiro
-from statsmodels.stats.anova import AnovaRM
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from matplotlib.patches import FancyArrowPatch
-import matplotlib.lines as mlines
+#!/usr/bin/env python
+# coding: utf-8
+"""
+Statistical analysis of multi-parameter experiments:
+  • five-number summary & Shapiro–Wilk
+  • Pearson & partial correlations
+  • PCA (scores + loadings)
+  • Custom box-plots
 
-# --------------------------
-# Helper function to format parameter names for LaTeX:
-# Converte gli underscore in pedici e i caret in esponenti.
-def format_param(name):
-    # Enclose characters following '^' in braces if not already
+Author      : <Your Name>
+Created     : 2025-07-10
+Reproducible: SEED = 42
+Python      : ≥3.9
+"""
+
+# ======================================================================
+# 0 · Imports and global settings
+# ======================================================================
+
+from __future__ import annotations
+
+import argparse
+import io
+import random
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as mticker
+from matplotlib.patches import FancyArrowPatch
+from scipy.stats import shapiro
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import statsmodels.stats.api as sms
+
+# ── reproducibility ───────────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+plt.rcParams.update(
+    {
+        "font.family": "serif",
+        "axes.labelsize": 11,
+        "axes.titlesize": 12,
+        "figure.dpi": 150,
+    }
+)
+
+# ======================================================================
+# 1 · Helper functions
+# ======================================================================
+
+
+def format_param(name: str) -> str:
+    """Convert '_' → subscripts, '^' → superscripts for LaTeX labels."""
     name = re.sub(r"\^(?!{)(\S+)", r"^{\1}", name)
-    # Enclose characters following '_' in braces if not already
     name = re.sub(r"_(?!{)(\S+)", r"_{\1}", name)
     return f"${name}$"
 
-# --------------------------
-# 1. Upload Your File
-# --------------------------
-print("Please upload your data file (Excel or CSV).")
-uploaded = files.upload()
-filename = list(uploaded.keys())[0]
 
-# --------------------------
-# 2. Read the File Based on Extension
-# --------------------------
-if filename.lower().endswith('.xlsx'):
-    df = pd.read_excel(io.BytesIO(uploaded[filename]), header=[0, 1])
-elif filename.lower().endswith('.csv'):
-    df = pd.read_csv(io.StringIO(uploaded[filename].decode('utf-8')), header=[0, 1])
-else:
-    raise ValueError("Unsupported file format. Please upload a CSV or Excel file.")
-
-# --------------------------
-# 3. Adjust Column Names for Identifier Columns
-# --------------------------
-new_columns = []
-for col in df.columns:
-    if isinstance(col, tuple):
-        if col[0] == "Parameter":
-            new_columns.append("Parameter")
-        elif col[0] == "Shapiro-Wilk":
-            new_columns.append("Shapiro-Wilk")
-        elif col[0] == "Boxplot":
-            new_columns.append("Boxplot")
-        elif col[0] == "PCA":
-            new_columns.append("PCA")
-        elif col[0] == "range":
-            new_columns.append("range")
-        elif col[0] == "Gruppo":
-            new_columns.append("Gruppo")
-        elif col[0] == "Titolo":       # Aggiunta per includere la colonna Titolo
-            new_columns.append("Titolo")
-        elif pd.isna(col[1]):
-            new_columns.append(col[0])
-        else:
-            new_columns.append(col)  # Keep measurement columns as tuple
-    else:
-        new_columns.append(col)
-df.columns = new_columns
-
-print("Columns after adjustment:")
-print(df.columns)
-
-# --------------------------
-# 4. Define Identifier and Measurement Columns
-# --------------------------
-id_vars = ["Parameter", "Shapiro-Wilk", "Boxplot", "PCA", "range", "Gruppo", "Titolo"]
-value_vars = [col for col in df.columns if col not in id_vars]
-
-print("Identifier columns:", id_vars)
-print("Measurement columns:", value_vars)
-
-# --------------------------
-# 5. Reshape the DataFrame into Long (Tidy) Format
-# --------------------------
-df_long = pd.melt(
-    df,
-    id_vars=id_vars,
-    value_vars=value_vars,
-    var_name='Test_Rep',
-    value_name='Value'
-)
-# Split the "Test_Rep" column into "Test" and "Replicate"
-df_long['Test'] = df_long['Test_Rep'].apply(lambda x: x[0] if isinstance(x, tuple) else x)
-df_long['Replicate'] = df_long['Test_Rep'].apply(lambda x: x[1] if isinstance(x, tuple) else None)
-df_long.drop(columns=['Test_Rep'], inplace=True)
-
-# Convert the "Value" column to numeric
-df_long["Value"] = pd.to_numeric(df_long["Value"], errors="coerce")
-
-print("\nLong-format DataFrame head:")
-print(df_long.head())
-
-# --------------------------
-# 6. Compute Five-Number Summary Statistics
-# --------------------------
-def five_number_summary(x):
-    return pd.Series({
-        "Count": x.count(),
-        "Min": x.min(),
-        "Q1": x.quantile(0.25),
-        "Median": x.median(),
-        "Q3": x.quantile(0.75),
-        "Max": x.max()
-    })
-
-summary_stats = (
-    df_long
-    .groupby(["Parameter", "Test"])["Value"]
-    .apply(five_number_summary)
-    .reset_index()
-)
-
-print("\nFive-number summary for each Parameter and Test:")
-print(summary_stats)
-
-# --------------------------
-# 7. Run Shapiro-Wilk Normality Test When Requested
-# --------------------------
-def run_shapiro(group):
-    flag = pd.to_numeric(group["Shapiro-Wilk"].iloc[0], errors="coerce")
-    non_null = group["Value"].dropna()
-    if len(non_null) < 3:
-        return pd.Series({"W": None, "p_value": None, "Normality": "Not enough data", "TestPerformed": False})
-    if flag == 1:
-        stat, p_value = shapiro(non_null)
-        conclusion = "Normal" if p_value > 0.05 else "Not normal"
-        return pd.Series({"W": stat, "p_value": p_value, "Normality": conclusion, "TestPerformed": True})
-    else:
-        return pd.Series({"W": None, "p_value": None, "Normality": "Test not performed", "TestPerformed": False})
-
-shapiro_results = df_long.groupby(["Parameter", "Test"]).apply(run_shapiro).reset_index()
-print("\nShapiro-Wilk test results:")
-print(shapiro_results)
-
-# --------------------------
-# 9. Pearson Correlation Matrix & PCA Analysis (for parameters with PCA == 1 only)
-# --------------------------
-selected_params = df_long[df_long["PCA"] == 1]["Parameter"].unique().tolist()
-print("\nParameters selected for PCA and correlation analysis:", selected_params)
-
-# Pivot to wide format: each row corresponds to an experiment (Test, Replicate); columns = Parameter.
-df_wide = df_long.pivot_table(index=["Test", "Replicate"], columns="Parameter", values="Value")
-df_wide = df_wide[selected_params]  # keep only PCA==1 parameters
-
-# Compute the Pearson correlation matrix.
-corr_matrix = df_wide.corr(method="pearson")
-
-# --------------------------
-# NEW: Compute Partial Correlation Matrix
-# --------------------------
-def partial_corr_matrix(df_in):
-    """
-    Returns the partial correlation matrix for df_in (each column a variable).
-    partial_corr(i,j) = -inv_corr[i,j]/sqrt(inv_corr[i,i]*inv_corr[j,j])
-    """
-    # 1) Compute the correlation matrix
-    corr = df_in.corr()
-
-    # 2) Invert the correlation matrix
-    #    We use np.linalg.pinv in case the matrix is not full rank; else np.linalg.inv
-    corr_inv = np.linalg.pinv(corr.values)
-
-    # 3) Build the partial correlation matrix
-    p_matrix = np.zeros_like(corr_inv)
-    diag_indices = np.diag_indices_from(p_matrix)
-    p_matrix[diag_indices] = 1.0  # set diagonal to 1
-
-    for i in range(corr_inv.shape[0]):
-        for j in range(corr_inv.shape[1]):
-            if i != j:
-                p_matrix[i, j] = -corr_inv[i, j] / np.sqrt(corr_inv[i, i] * corr_inv[j, j])
-
-    # Convert to DataFrame with same labels
-    partial_corr_df = pd.DataFrame(p_matrix,
-                                   index=corr.index,
-                                   columns=corr.columns)
-    return partial_corr_df
-
-partial_corr_df = partial_corr_matrix(df_wide)
-
-# Standardize the diagonal for clarity
-# (In partial correlation matrices, diagonal is 1 by definition.)
-
-# --------------------------
-# Perform PCA
-# --------------------------
-scaler = StandardScaler()
-df_wide_std = scaler.fit_transform(df_wide.dropna())  # ensure no NaNs
-
-pca_model = PCA(n_components=2)
-principal_components = pca_model.fit_transform(df_wide_std)
-loadings = pca_model.components_.T  # shape: (n_features, 2)
-explained_variance = pca_model.explained_variance_ratio_
-
-# Create a DataFrame for PCA loadings.
-pca_loadings_df = pd.DataFrame(loadings, index=df_wide.columns, columns=["PC1", "PC2"]).reset_index().rename(columns={"index": "Parameter"})
-
-# Create a DataFrame for PCA scores for each observation.
-# Note: We must dropna from df_wide index to align with PCA output
-valid_index = df_wide.dropna().index
-pca_scores_df = pd.DataFrame(principal_components, columns=["PC1", "PC2"], index=valid_index).reset_index()
-
-# --------------------------
-# 10. Save All Results to an Excel File with Multiple Sheets
-# --------------------------
-output_filename = "statistical_analysis_results.xlsx"
-with pd.ExcelWriter(output_filename) as writer:
-    summary_stats.to_excel(writer, sheet_name="Summary", index=False)
-    shapiro_results.to_excel(writer, sheet_name="Shapiro-Wilk", index=False)
-    corr_matrix.reset_index().to_excel(writer, sheet_name="Correlation", index=False)
-    partial_corr_df.reset_index().to_excel(writer, sheet_name="PartialCorrelation", index=False)
-    pca_loadings_df.to_excel(writer, sheet_name="PCA_Loadings", index=False)
-    pca_scores_df.to_excel(writer, sheet_name="PCA Scores", index=False)
-
-files.download(output_filename)
-
-# --------------------------
-# 11. Print Main Outcomes About Normality
-# --------------------------
-print("\nNormality Test Outcomes:")
-for idx, row in shapiro_results.iterrows():
-    param = row["Parameter"]
-    test = row["Test"]
-    if row["TestPerformed"]:
-        outcome = f"Parameter '{param}' in Test '{test}': W = {row['W']:.4f}, p-value = {row['p_value']:.4f} => {row['Normality']}"
-    else:
-        outcome = f"Parameter '{param}' in Test '{test}': {row['Normality']}."
-    print(outcome)
-
-# --------------------------
-# 12. Create a unified figure with 3 subplots (vertical):
-# (A) - Pearson Correlation Heatmap
-# (B) - PCA Biplot
-# (C) - Partial Correlation Heatmap
-# --------------------------
-fig, axes = plt.subplots(3, 1, figsize=(12, 28))
-
-## (A) Pearson Correlation Heatmap
-ax1 = axes[0]
-sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="coolwarm", vmin=-1, vmax=1, ax=ax1)
-ax1.set_xlabel("")
-ax1.set_xticklabels([format_param(label.get_text()) for label in ax1.get_xticklabels()], rotation=45, ha='right')
-ax1.set_yticklabels([format_param(label.get_text()) for label in ax1.get_yticklabels()], rotation=0)
-for spine in ax1.spines.values():
-    spine.set_edgecolor('black')
-ax1.set_title("(A) Pearson Correlation", loc='left', fontsize=20, fontweight='bold')
-
-## (B) PCA Biplot
-ax2 = axes[1]
-sns.scatterplot(data=pca_scores_df, x="PC1", y="PC2", hue="Test", palette="colorblind", s=100, alpha=0.7, ax=ax2)
-ax2.tick_params(axis='both', which='major', labelsize=16)
-
-# Scale factor for arrow lengths
-scaling_factor = 8
-for param in pca_loadings_df["Parameter"]:
-    row = pca_loadings_df[pca_loadings_df["Parameter"] == param]
-    if row.empty:
-        continue
-    pc1 = row["PC1"].values[0]
-    pc2 = row["PC2"].values[0]
-    arrow_length_x = pc1 * scaling_factor
-    arrow_length_y = pc2 * scaling_factor
-    arrow = FancyArrowPatch(
-        (0,0),
-        (arrow_length_x, arrow_length_y),
-        arrowstyle='-|>',
-        mutation_scale=20,
-        color='black',
-        linewidth=2
+def five_number_summary(x: pd.Series) -> pd.Series:
+    """Return count, min, Q1, median, Q3, max."""
+    return pd.Series(
+        {
+            "Count": x.count(),
+            "Min": x.min(),
+            "Q1": x.quantile(0.25),
+            "Median": x.median(),
+            "Q3": x.quantile(0.75),
+            "Max": x.max(),
+        }
     )
-    ax2.add_patch(arrow)
-    ax2.text(arrow_length_x * 1.15, arrow_length_y * 1.15, format_param(param),
-             color='black', fontsize=14)
 
-ax2.set_xlabel(f"PC1 ({explained_variance[0]*100:.1f}% var.)", fontsize=16)
-ax2.set_ylabel(f"PC2 ({explained_variance[1]*100:.1f}% var.)", fontsize=16)
-ax2.set_xlim(-5,5)
-ax2.set_ylim(-5,5)
-ax2.grid(False)
-for spine in ax2.spines.values():
-    spine.set_edgecolor('black')
-ax2.set_title("(B) PCA Biplot", loc='left', fontsize=20, fontweight='bold')
 
-## (C) Partial Correlation Heatmap
-ax3 = axes[2]
-sns.heatmap(partial_corr_df, annot=True, fmt=".2f", cmap="coolwarm", vmin=-1, vmax=1, ax=ax3)
-ax3.set_xlabel("")
-ax3.set_xticklabels([format_param(label.get_text()) for label in ax3.get_xticklabels()], rotation=45, ha='right')
-ax3.set_yticklabels([format_param(label.get_text()) for label in ax3.get_yticklabels()], rotation=0)
-for spine in ax3.spines.values():
-    spine.set_edgecolor('black')
-ax3.set_title("(C) Partial Correlation", loc='left', fontsize=20, fontweight='bold')
+def partial_corr_matrix(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Partial correlation via precision matrix (inverse of correlation)."""
+    corr = df_in.corr().to_numpy()
+    prec = np.linalg.pinv(corr)
+    pmat = -prec / np.sqrt(np.outer(np.diag(prec), np.diag(prec)))
+    np.fill_diagonal(pmat, 1.0)
+    return pd.DataFrame(pmat, index=df_in.columns, columns=df_in.columns)
 
-plt.tight_layout()
-plt.show()
 
-# --------------------------
-# 13. Create Box Plots for flagged parameters
-# (unchanged from your original, except for numbering the figure differently)
-# --------------------------
-df_box = df_long[df_long["Boxplot"].astype(float) == 1]
+# ======================================================================
+# 2 · Core analysis
+# ======================================================================
 
-groups = ["Input", "Process"]
-ncols = len(groups)
-nrows = 4  # 4 boxplots per group
 
-desired_order_input = ["A", "B", "C", "D"]
-desired_order_process = ["E", "F", "G", "H"]
-
-group_params = {}
-group_titolo = {}
-for g in groups:
-    subset = df_box[df_box["Gruppo"] == g]
-    param_titolo = subset[['Parameter', 'Titolo']].drop_duplicates()
-    if g == "Input":
-        param_titolo["Titolo"] = pd.Categorical(param_titolo["Titolo"], categories=desired_order_input, ordered=True)
+def load_data(path: Path) -> pd.DataFrame:
+    """Read Excel or CSV with first two rows as header (multi-index)."""
+    if path.suffix.lower() == ".xlsx":
+        return pd.read_excel(path, header=[0, 1])
+    elif path.suffix.lower() == ".csv":
+        return pd.read_csv(path, header=[0, 1])
     else:
-        param_titolo["Titolo"] = pd.Categorical(param_titolo["Titolo"], categories=desired_order_process, ordered=True)
-    param_titolo_sorted = param_titolo.sort_values(by='Titolo')
-    group_params[g] = param_titolo_sorted['Parameter'].tolist()
-    group_titolo[g] = param_titolo_sorted['Titolo'].tolist()
+        raise ValueError("Unsupported file format; use .xlsx or .csv")
 
-fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10, 15), squeeze=False)
-for col_idx, group in enumerate(groups):
-    axes[0, col_idx].set_title(group, fontsize=16, fontweight='bold', pad=20)
-    params = group_params.get(group, [])
-    titoli = group_titolo.get(group, [])
-    for row_idx in range(nrows):
-        ax = axes[row_idx, col_idx]
-        if row_idx < len(params):
-            param = params[row_idx]
-            letter = titoli[row_idx]  # Label from the "Titolo" column
-            subset = df_box[(df_box["Gruppo"] == group) & (df_box["Parameter"] == param)]
-            sns.boxplot(x="Test", y="Value", data=subset, hue="Test", palette="colorblind", ax=ax)
-            if ax.get_legend():
-                ax.legend_.remove()
-            ax.set_xlabel("")
-            ax.set_ylabel(format_param(param))
-            # Set y-axis limits using the "range" column if available
-            r = subset["range"].iloc[0] if not subset["range"].isnull().all() else None
-            if r is not None and isinstance(r, str) and ',' in r:
-                try:
-                    parts = r.split(',')
-                    lower = float(parts[0].strip())
-                    upper = float(parts[1].strip())
-                    ax.set_ylim(lower, upper)
-                    ticks = np.linspace(lower, upper, 6)
-                    ax.set_yticks(ticks)
-                except Exception as e:
-                    print(f"Error converting range for parameter {param}: {e}")
-            ax.text(0.01, 1.10, f"({letter})", transform=ax.transAxes,
-                    fontsize=14, fontweight='bold',
-                    verticalalignment='top', horizontalalignment='left',
-                    color='black')
+
+def tidy_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    • Harmonise column names for identifier columns.
+    • Melt to long format with columns:
+        Parameter, Shapiro-Wilk, Boxplot, PCA, range, Gruppo, Titolo,
+        Test, Replicate, Value
+    Returns
+    -------
+    df_long : pd.DataFrame
+    id_vars : list[str]
+    """
+    id_map = {
+        "Parameter": "Parameter",
+        "Shapiro-Wilk": "Shapiro-Wilk",
+        "Boxplot": "Boxplot",
+        "PCA": "PCA",
+        "range": "range",
+        "Gruppo": "Gruppo",
+        "Titolo": "Titolo",
+    }
+
+    new_cols = []
+    for col in df.columns:
+        if isinstance(col, tuple):
+            lbl = id_map.get(col[0])
+            new_cols.append(lbl or col if not pd.isna(col[1]) else col[0])
         else:
-            ax.axis('off')
+            new_cols.append(col)
+    df.columns = new_cols
 
-plt.tight_layout(rect=[0, 0, 1, 0.95])
-plt.show()
+    id_vars = list(id_map.values())
+    value_vars = [c for c in df.columns if c not in id_vars]
+
+    df_long = pd.melt(
+        df,
+        id_vars=id_vars,
+        value_vars=value_vars,
+        var_name="Test_Rep",
+        value_name="Value",
+    )
+    df_long["Test"] = df_long["Test_Rep"].apply(
+        lambda x: x[0] if isinstance(x, tuple) else x
+    )
+    df_long["Replicate"] = df_long["Test_Rep"].apply(
+        lambda x: x[1] if isinstance(x, tuple) else None
+    )
+    df_long.drop(columns=["Test_Rep"], inplace=True)
+    df_long["Value"] = pd.to_numeric(df_long["Value"], errors="coerce")
+
+    return df_long, id_vars
+
+
+def shapiro_by_group(df_long: pd.DataFrame) -> pd.DataFrame:
+    """Run Shapiro-Wilk where the flag column == 1."""
+    def _run(group):
+        flag = pd.to_numeric(group["Shapiro-Wilk"].iloc[0], errors="coerce")
+        vals = group["Value"].dropna()
+        if len(vals) < 3 or flag != 1:
+            return pd.Series(
+                {"W": np.nan, "p_value": np.nan, "Normality": "Not tested"}
+            )
+        stat, p = shapiro(vals)
+        return pd.Series(
+            {
+                "W": stat,
+                "p_value": p,
+                "Normality": "Normal" if p > 0.05 else "Not normal",
+            }
+        )
+
+    return (
+        df_long.groupby(["Parameter", "Test"], group_keys=False)
+        .apply(_run)
+        .reset_index()
+    )
+
+
+def pca_analysis(df_wide: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
+    """Standardise, fit PCA (2 components), return loadings, scores, variance."""
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df_wide.dropna())
+    pca = PCA(n_components=2, random_state=SEED)
+    scores = pca.fit_transform(X)
+    loadings = pca.components_.T
+    var = pca.explained_variance_ratio_
+    load_df = (
+        pd.DataFrame(loadings, columns=["PC1", "PC2"], index=df_wide.columns)
+        .reset_index()
+        .rename(columns={"index": "Parameter"})
+    )
+    scor_df = (
+        pd.DataFrame(scores, columns=["PC1", "PC2"], index=df_wide.dropna().index)
+        .reset_index()
+    )
+    return load_df, scor_df, var
+
+
+# ======================================================================
+# 3 · Plotting functions
+# ======================================================================
+
+
+def plot_heatmap(ax, matrix: pd.DataFrame, title: str) -> None:
+    sns.heatmap(matrix, ax=ax, annot=True, cmap="coolwarm", vmin=-1, vmax=1, fmt=".2f")
+    ax.set_title(title, loc="left", fontsize=16, fontweight="bold")
+    ax.set_xlabel("")
+    ax.set_xticklabels(
+        [format_param(t.get_text()) for t in ax.get_xticklabels()],
+        rotation=45,
+        ha="right",
+    )
+    ax.set_yticklabels(
+        [format_param(t.get_text()) for t in ax.get_yticklabels()], rotation=0
+    )
+    for spine in ax.spines.values():
+        spine.set_edgecolor("black")
+
+
+def plot_pca_biplot(
+    ax, scores: pd.DataFrame, loads: pd.DataFrame, var: np.ndarray
+) -> None:
+    sns.scatterplot(
+        data=scores, x="PC1", y="PC2", hue="Test", palette="colorblind", s=90, ax=ax
+    )
+    scale = 8
+    for _, row in loads.iterrows():
+        x, y = row["PC1"] * scale, row["PC2"] * scale
+        arrow = FancyArrowPatch(
+            (0, 0), (x, y), arrowstyle="-|>", mutation_scale=18, color="black", lw=1.5
+        )
+        ax.add_patch(arrow)
+        ax.text(x * 1.15, y * 1.15, format_param(row["Parameter"]), fontsize=10)
+
+    ax.set_xlabel(f"PC1 ({var[0]*100:.1f} %)")
+    ax.set_ylabel(f"PC2 ({var[1]*100:.1f} %)")
+    ax.set_xlim(-5, 5)
+    ax.set_ylim(-5, 5)
+    ax.set_title("(B) PCA Biplot", loc="left", fontsize=16, fontweight="bold")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("black")
+
+
+def plot_boxplots(df_box: pd.DataFrame, out_dir: Path) -> None:
+    groups = ["Input", "Process"]
+    ncols, nrows = 2, 4
+    desired_order = {
+        "Input": ["A", "B", "C", "D"],
+        "Process": ["E", "F", "G", "H"],
+    }
+    fig, axes = plt.subplots(nrows, ncols, figsize=(9, 12), squeeze=False)
+    for c, grp in enumerate(groups):
+        axes[0, c].set_title(grp, fontsize=14, fontweight="bold", pad=15)
+        subset = df_box[df_box["Gruppo"] == grp]
+        params = (
+            subset[["Parameter", "Titolo"]]
+            .drop_duplicates()
+            .assign(
+                Titolo=lambda d: pd.Categorical(
+                    d["Titolo"], ordered=True, categories=desired_order[grp]
+                )
+            )
+            .sort_values("Titolo")
+        )
+        for r in range(nrows):
+            ax = axes[r, c]
+            if r < len(params):
+                p, letter = params.iloc[r]
+                data = subset[subset["Parameter"] == p]
+                sns.boxplot(x="Test", y="Value", data=data, palette="colorblind", ax=ax)
+                if ax.get_legend():
+                    ax.legend_.remove()
+                ax.set_xlabel("")
+                ax.set_ylabel(format_param(p))
+                rng = data["range"].iloc[0]
+                if isinstance(rng, str) and "," in rng:
+                    low, high = map(float, rng.split(","))
+                    ax.set_ylim(low, high)
+                ax.text(
+                    0.01,
+                    1.05,
+                    f"({letter})",
+                    transform=ax.transAxes,
+                    fontweight="bold",
+                )
+            else:
+                ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out_dir / "boxplots.pdf")
+
+
+# ======================================================================
+# 4 · Main pipeline
+# ======================================================================
+
+
+def main(data_file: Path, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 4.1 · Load & tidy
+    raw_df = load_data(data_file)
+    df_long, id_vars = tidy_dataframe(raw_df)
+
+    # 4.2 · Five-number summary
+    summary = (
+        df_long.groupby(["Parameter", "Test"])["Value"]
+        .apply(five_number_summary)
+        .reset_index()
+    )
+
+    # 4.3 · Shapiro–Wilk
+    shapiro_df = shapiro_by_group(df_long)
+
+    # 4.4 · Correlations & PCA (only parameters with PCA == 1)
+    pca_params = df_long[df_long["PCA"] == 1]["Parameter"].unique()
+    df_wide = (
+        df_long.pivot_table(
+            index=["Test", "Replicate"], columns="Parameter", values="Value"
+        )[pca_params]
+    )
+
+    pearson = df_wide.corr(method="pearson")
+    partial = partial_corr_matrix(df_wide)
+
+    load_df, score_df, var_exp = pca_analysis(df_wide)
+
+    # 4.5 · Save tables
+    with pd.ExcelWriter(out_dir / "stat_results.xlsx") as xl:
+        summary.to_excel(xl, sheet_name="Summary", index=False)
+        shapiro_df.to_excel(xl, sheet_name="Shapiro-Wilk", index=False)
+        pearson.to_excel(xl, sheet_name="Pearson")
+        partial.to_excel(xl, sheet_name="PartialCorr")
+        load_df.to_excel(xl, sheet_name="PCA_Loadings", index=False)
+        score_df.to_excel(xl, sheet_name="PCA_Scores", index=False)
+
+    pearson.to_csv(out_dir / "pearson_corr.csv")
+    partial.to_csv(out_dir / "partial_corr.csv")
+
+    # 4.6 · Unified figure (Pearson, PCA, Partial)
+    fig, axes = plt.subplots(3, 1, figsize=(10, 20))
+    plot_heatmap(axes[0], pearson, "(A) Pearson Correlation")
+    plot_pca_biplot(axes[1], score_df, load_df, var_exp)
+    plot_heatmap(axes[2], partial, "(C) Partial Correlation")
+    fig.tight_layout()
+    fig.savefig(out_dir / "summary_plots.pdf")
+    fig.savefig(out_dir / "summary_plots.png", dpi=300)
+
+    # 4.7 · Box-plots for flagged parameters
+    df_box = df_long[df_long["Boxplot"].astype(float) == 1]
+    if not df_box.empty:
+        plot_boxplots(df_box, out_dir)
+
+    # 4.8 · Console report (normality)
+    print("\nNormality outcomes:")
+    for _, row in shapiro_df.iterrows():
+        p, t = row["Parameter"], row["Test"]
+        if pd.isna(row["W"]):
+            msg = f"{p} – {t}: {row['Normality']}"
+        else:
+            msg = f"{p} – {t}: W={row['W']:.3f}, p={row['p_value']:.3f} → {row['Normality']}"
+        print(msg)
+
+    print(f"\n✔ Analysis complete — outputs saved in “{out_dir}”")
+
+
+# ======================================================================
+# 5 · CLI
+# ======================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Multivariate statistical workflow")
+    parser.add_argument("data_file", type=str, help="Path to Excel/CSV data file")
+    parser.add_argument("--out", type=str, default="analysis_output", help="Output dir")
+    args = parser.parse_args()
+
+    main(Path(args.data_file), Path(args.out))
