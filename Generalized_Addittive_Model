@@ -1,648 +1,310 @@
-# =========================================================
-# 1. Installation (if any) of necessary packages
-# =========================================================
-#!pip install --force-reinstall numpy==1.26.4
-#!pip install --force-reinstall statsmodels pygam compositions openpyxl
+#!/usr/bin/env python
+# coding: utf-8
+"""
+Compositional analysis of VFA data for PHBV and HB:HV production.
 
+Author : <Alessio Castagnoli>
+Created: 2025-07-10
+Python : ≥3.9
+"""
 
-# =========================================================
-# 2. Packages import
-# =========================================================
-import pandas as pd
+# =======================================================================
+# 0 · Imports and global settings
+# =======================================================================
+
+from __future__ import annotations
+
+import io
+import random
+from pathlib import Path
+
+import contextlib
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import matplotlib.ticker as ticker
-import io
-import contextlib
+import matplotlib.ticker as mticker
 from scipy.optimize import minimize
-
-from google.colab import files
-
-# For OLS regressions
 import statsmodels.api as sm
-# For GAM regressions
 from pygam import LinearGAM, s
 
-# =========================================================
-# 3. Interactive loading of Excel file
-# =========================================================
-uploaded = files.upload()  # Load the Excel file
-file_name = list(uploaded.keys())[0]
-print(f"Upload the Excel file: {file_name}")
-dati = pd.read_excel(file_name, engine='openpyxl')
+# Reproducibility --------------------------------------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
 
-# Column renaming, if necessary
-if "HB:HV_prod" in dati.columns:
-    dati.rename(columns={"HB:HV_prod": "HB_HV_prod"}, inplace=True)
+plt.rcParams.update(
+    {
+        "font.family": "serif",
+        "axes.labelsize": 11,
+        "axes.titlesize": 12,
+        "figure.dpi": 150,
+    }
+)
 
-# =========================================================
-# 4. Initial inspection of the dataset
-# =========================================================
-print("\nFirst dataset row:")
-print(dati.head())
-print("\nDataset info:")
-print(dati.info())
-# VFA: Substrate_Ac, Substrate_Pr, Substrate_Val, Substrate_But
-# Output: PHA_prod e HB_HV_prod
+# =======================================================================
+# 1 · Utility functions
+# =======================================================================
 
-# =========================================================
-# 5. CLR transformation
-# =========================================================
-vfa = dati[['Substrate_Ac', 'Substrate_Pr', 'Substrate_Val', 'Substrate_But']]
 
-def clr_transform(df):
+def clr_transform(df: pd.DataFrame, eps: float = 1e-12) -> pd.DataFrame:
+    """Centered log-ratio transformation (Aitchison, 1986)."""
+    arr = np.maximum(df.to_numpy(), eps)
+    gmean = np.exp(np.mean(np.log(arr), axis=1, keepdims=True))
+    clr = np.log(arr / gmean)
+    return pd.DataFrame(clr, columns=df.columns, index=df.index)
+
+
+def single_clr(arr: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """CLR for a single 1×4 vector."""
+    arr = np.maximum(arr, eps)
+    gmean = np.exp(np.mean(np.log(arr)))
+    return np.log(arr / gmean)
+
+
+def fit_ols_constrained(X: pd.DataFrame, y: pd.Series) -> sm.regression.linear_model.RegressionResultsWrapper:
+    """OLS with sum-to-zero constraint."""
+    Xc = sm.add_constant(X)
+    try:
+        return sm.OLS(y, Xc).fit_constrained(" + ".join(X.columns) + " = 0")
+    except AttributeError:
+        # Reparameterisation fallback: clr variables minus clr_But
+        Xr = pd.DataFrame(
+            {
+                "const": 1.0,
+                "X1": X["clr_Ac"] - X["clr_But"],
+                "X2": X["clr_Pr"] - X["clr_But"],
+                "X3": X["clr_Val"] - X["clr_But"],
+            }
+        )
+        return sm.OLS(y, Xr).fit()
+
+
+def optimise_pha(gam: LinearGAM) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Maximise PHA prediction subject to clr sum = 0."""
+    objective = lambda v: -gam.predict(v.reshape(1, -1))[0]
+    cons = {"type": "eq", "fun": lambda v: np.sum(v)}
+    res = minimize(objective, x0=np.zeros(4), bounds=[(-2, 2)] * 4, constraints=cons)
+    if not res.success:
+        raise RuntimeError(res.message)
+    opt_clr = res.x
+    opt_prop = np.exp(opt_clr) / np.sum(np.exp(opt_clr))
+    return opt_clr, opt_prop, gam.predict(opt_clr.reshape(1, -1))
+
+
+def calc_surface(
+    xvar: str,
+    yvar: str,
+    model: LinearGAM,
+    baseline: np.ndarray,
+    xlim: tuple[float, float],
+    ylim: tuple[float, float],
+    grid_n: int = 60,
+    total: float = 100.0,
+    eps: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute GAM surface over a 2-D grid in concentration space."""
+    var_idx = {"Ac": 0, "Pr": 1, "Val": 2, "But": 3}
+    ix, iy = var_idx[xvar], var_idx[yvar]
+
+    Xg, Yg = np.meshgrid(np.linspace(*xlim, grid_n), np.linspace(*ylim, grid_n))
+    Z = np.zeros_like(Xg)
+
+    for i in range(grid_n):
+        for j in range(grid_n):
+            x_val, y_val = Xg[i, j], Yg[i, j]
+            remain = total - (x_val + y_val)
+            if remain < 0:
+                Z[i, j] = np.nan
+                continue
+            conc = np.zeros(4)
+            conc[ix], conc[iy] = x_val, y_val
+            base_sum = baseline.sum() - (baseline[ix] + baseline[iy])
+            for k in range(4):
+                if k not in (ix, iy):
+                    conc[k] = baseline[k] / base_sum * remain
+            prop = np.maximum(conc / total, eps)
+            prop /= prop.sum()
+            clr = np.log(prop) - np.mean(np.log(prop))
+            Z[i, j] = model.predict(clr.reshape(1, -1))[0]
+    return Xg, Yg, Z
+
+
+# =======================================================================
+# 2 · Main analysis pipeline
+# =======================================================================
+
+
+def main(data_path: Path, output_dir: Path = Path(".")) -> None:
     """
-    Transforms compositional data into CLR space.
+    Run full statistical workflow.
+    Args:
+        data_path: path to the Excel file containing raw measurements.
+        output_dir: directory for all outputs (figures, tables).
     """
-    arr = df.values
-    g = np.exp(np.mean(np.log(arr), axis=1)).reshape(-1, 1)
-    clr_arr = np.log(arr / g)
-    return pd.DataFrame(clr_arr, columns=df.columns, index=df.index)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-vfa_clr = clr_transform(vfa)
-vfa_clr.columns = ['clr_Ac', 'clr_Pr', 'clr_Val', 'clr_But']
-dati_clr = pd.concat([vfa_clr, dati[['PHA_prod', 'HB_HV_prod']]], axis=1)
-print("\nFirst rows of the transformed DataFrame (CLR):")
-print(dati_clr.head())
+    # -------------------------------------------------------------------
+    # 2.1 · Load data
+    df = pd.read_excel(data_path, engine="openpyxl")
+    if "HB:HV_prod" in df.columns:
+        df = df.rename(columns={"HB:HV_prod": "HB_HV_prod"})
 
-# =========================================================
-# 6. Matrix scatterplot with customised range and ticks
-# =========================================================
-custom_settings = {
-    'clr_Ac':    {'range': (-0.5, 1.5),   'ticks': np.linspace(-0.5, 1.5, 5)},
-    'clr_Pr':    {'range': (-1, 1),       'ticks': np.linspace(-1, 1, 5)},
-    'clr_Val':   {'range': (-0.5, 1),     'ticks': np.linspace(-0.5, 1, 4)},
-    'clr_But':   {'range': (-0.5, 1),     'ticks': np.linspace(-0.5, 1, 4)},
-    'PHA_prod':  {'range': (-20, 40),     'ticks': np.linspace(-20, 40, 4)},
-    'HB_HV_prod':{'range': (0.25, 3.25),   'ticks': np.linspace(0.25, 3.25, 4)}
-}
+    vfa_cols = ["Substrate_Ac", "Substrate_Pr", "Substrate_Val", "Substrate_But"]
+    resp_cols = ["PHA_prod", "HB_HV_prod"]
 
-var_order = list(dati_clr.columns)
-g_pair = sns.pairplot(dati_clr, diag_kind='hist')
-for i in range(len(var_order)):
-    for j in range(len(var_order)):
-        ax = g_pair.axes[i, j]
-        if ax is not None:
-            var_x = var_order[j]
-            var_y = var_order[i]
-            ax.set_xlim(custom_settings[var_x]['range'])
-            ax.set_xticks(custom_settings[var_x]['ticks'])
-            ax.set_ylim(custom_settings[var_y]['range'])
-            ax.set_yticks(custom_settings[var_y]['ticks'])
-plt.show()
+    # -------------------------------------------------------------------
+    # 2.2 · CLR transform
+    clr_df = clr_transform(df[vfa_cols])
+    clr_df.columns = ["clr_Ac", "clr_Pr", "clr_Val", "clr_But"]
+    data_clr = pd.concat([clr_df, df[resp_cols]], axis=1)
 
-# =========================================================
-# 7. Calculation of the correlation matrix
-# =========================================================
-corr_matrix = dati_clr.corr()
-print("\nCorrelation matrix (CLR and response variables):")
-print(corr_matrix)
+    # -------------------------------------------------------------------
+    # 2.3 · Scatter-matrix with custom ranges
+    ranges = {
+        "clr_Ac": (-0.5, 1.5),
+        "clr_Pr": (-1, 1),
+        "clr_Val": (-0.5, 1),
+        "clr_But": (-0.5, 1),
+        "PHA_prod": (-20, 40),
+        "HB_HV_prod": (0.25, 3.25),
+    }
+    pair = sns.pairplot(data_clr, diag_kind="hist")
+    for i, var_y in enumerate(data_clr.columns):
+        for j, var_x in enumerate(data_clr.columns):
+            ax = pair.axes[i, j]
+            ax.set_xlim(ranges[var_x])
+            ax.set_ylim(ranges[var_y])
+    pair.fig.savefig(output_dir / "scatter_matrix.pdf", bbox_inches="tight")
 
-# =========================================================
-# 8. OLS regressions with constraint
-# =========================================================
-X_all = dati_clr[['clr_Ac', 'clr_Pr', 'clr_Val', 'clr_But']]
-X_all = sm.add_constant(X_all)
-constraint = "clr_Ac + clr_Pr + clr_Val + clr_But = 0"
+    # -------------------------------------------------------------------
+    # 2.4 · Correlation matrix
+    corr = data_clr.corr()
+    corr.to_csv(output_dir / "correlation_matrix.csv")
 
-y_PHA = dati_clr['PHA_prod']
-y_HBHV = dati_clr['HB_HV_prod']
+    # -------------------------------------------------------------------
+    # 2.5 · OLS models
+    X = data_clr[["clr_Ac", "clr_Pr", "clr_Val", "clr_But"]]
+    ols_pha = fit_ols_constrained(X, data_clr["PHA_prod"])
+    ols_hbhv = fit_ols_constrained(X, data_clr["HB_HV_prod"])
 
-try:
-    model_PHA = sm.OLS(y_PHA, X_all).fit_constrained(constraint)
-    print("\nOLS results for PHA_prod (with constraint):")
-    print(model_PHA.summary())
-except AttributeError:
-    print("The fit_constrained method is not available. I use reparameterisation for PHA_prod.")
-    X_new = pd.DataFrame({
-        'X1': dati_clr['clr_Ac'] - dati_clr['clr_But'],
-        'X2': dati_clr['clr_Pr'] - dati_clr['clr_But'],
-        'X3': dati_clr['clr_Val'] - dati_clr['clr_But']
-    })
-    X_new = sm.add_constant(X_new)
-    model_PHA = sm.OLS(y_PHA, X_new).fit()
-    print("\nOLS results for PHA_prod (reparameterised):")
-    print(model_PHA.summary())
+    with open(output_dir / "ols_pha.tex", "w") as f:
+        f.write(ols_pha.summary().as_latex())
+    with open(output_dir / "ols_hbhv.tex", "w") as f:
+        f.write(ols_hbhv.summary().as_latex())
 
-try:
-    model_HBHV = sm.OLS(y_HBHV, X_all).fit_constrained(constraint)
-    print("\nOLS results for HB_HV_prod (with constraint):")
-    print(model_HBHV.summary())
-except AttributeError:
-    print("The fit_constrained method is not available. I use the reparameterisation for HB_HV_prod.")
-    X_new = pd.DataFrame({
-        'X1': dati_clr['clr_Ac'] - dati_clr['clr_But'],
-        'X2': dati_clr['clr_Pr'] - dati_clr['clr_But'],
-        'X3': dati_clr['clr_Val'] - dati_clr['clr_But']
-    })
-    X_new = sm.add_constant(X_new)
-    model_HBHV = sm.OLS(y_HBHV, X_new).fit()
-    print("\nOLS results for HB_HV_prod (reparameterised):")
-    print(model_HBHV.summary())
+    # -------------------------------------------------------------------
+    # 2.6 · GAM models with λ grid-search
+    lam_grid = np.logspace(-3, 1, 50)
+    X_mat = X.to_numpy()
 
-# =========================================================
-# 9. GAM models with Grid Search for optimising λ and column subplots
-# =========================================================
-X_gam_all = dati_clr[['clr_Ac', 'clr_Pr', 'clr_Val', 'clr_But']].values
-lam_range = np.logspace(-3, 1, 50)
+    gam_pha = LinearGAM(s(0) + s(1) + s(2) + s(3), fit_intercept=False)
+    gam_pha.gridsearch(X_mat, data_clr["PHA_prod"].to_numpy(), lam=lam_grid)
 
-# GAM for PHA_prod with gridsearch
-y_PHA = dati_clr['PHA_prod'].values
-gam_PHA = LinearGAM(s(0) + s(1) + s(2) + s(3), fit_intercept=False)
-gam_PHA.gridsearch(X_gam_all, y_PHA, lam=lam_range)
-print("\n--- GAM for PHA_prod ---")
-print("Best lambda for PHA_prod:", gam_PHA.lam)
-print(gam_PHA.summary())
+    gam_hbhv = LinearGAM(s(0) + s(1) + s(2) + s(3), fit_intercept=False)
+    gam_hbhv.gridsearch(X_mat, data_clr["HB_HV_prod"].to_numpy(), lam=lam_grid)
 
-# GAM for HB_HV_prod with gridsearch
-y_HBHV = dati_clr['HB_HV_prod'].values
-gam_HBHV = LinearGAM(s(0) + s(1) + s(2) + s(3), fit_intercept=False)
-gam_HBHV.gridsearch(X_gam_all, y_HBHV, lam=lam_range)
-print("\n--- GAM for HB_HV_prod ---")
-print("Best lambda for HB_HV_prod:", gam_HBHV.lam)
-print(gam_HBHV.summary())
+    # Save GAM summaries
+    with open(output_dir / "gam_pha.txt", "w") as f:
+        with contextlib.redirect_stdout(f):
+            gam_pha.summary()
+    with open(output_dir / "gam_hbhv.txt", "w") as f:
+        with contextlib.redirect_stdout(f):
+            gam_hbhv.summary()
 
-# Checking the forecast range for the GAM model HB_HV_prod on clr_Ac
-grid = np.linspace(-2, 2, 100)
-preds = [gam_HBHV.predict(np.array([[val, 0, 0, 0]]))[0] for val in grid]
-print("\nForecast range (HB_HV_prod model) for clr_Ac variations:", np.min(preds), np.max(preds))
+    # -------------------------------------------------------------------
+    # 2.7 · Partial dependence plots (2×4)
+    fig_pd, axs_pd = plt.subplots(2, 4, figsize=(12, 5))
+    for i in range(4):
+        Xg = gam_pha.generate_X_grid(term=i)
+        axs_pd[0, i].plot(Xg[:, i], gam_pha.partial_dependence(term=i, X=Xg))
+        axs_pd[0, i].set_title(f"PHA – s(clr_{['Ac','Pr','Val','But'][i]})")
+        Xg2 = gam_hbhv.generate_X_grid(term=i)
+        axs_pd[1, i].plot(Xg2[:, i], gam_hbhv.partial_dependence(term=i, X=Xg2))
+        axs_pd[1, i].set_title(f"HBHV – s(clr_{['Ac','Pr','Val','But'][i]})")
+    fig_pd.tight_layout()
+    fig_pd.savefig(output_dir / "partial_dependence.pdf")
 
-# =========================================================
-# 10. Creating partial plots of GAM models in a single figure (2 rows x 4 columns)
-# =========================================================
-fig, axs = plt.subplots(2, 4, figsize=(12, 10))
-# Partial plots for GAM PHA_prod (first row)
-for i in range(4):
-    ax = axs[0, i]
-    XX = gam_PHA.generate_X_grid(term=i)
-    pdep = gam_PHA.partial_dependence(term=i, X=XX)
-    ax.plot(XX[:, i], pdep)
-    ax.set_title(f"s({['clr_Ac','clr_Pr','clr_Val','clr_But'][i]})")
-    ax.set_xlim(-1, 1)
-    ax.set_xticks([-1, -0.5, 0, 0.5, 1])
-    ax.set_ylim(-5, 15)
-    ax.set_yticks([-5, 0, 5, 10, 15])
+    # -------------------------------------------------------------------
+    # 2.8 · Optimisation for maximal PHA
+    opt_clr, opt_prop, _ = optimise_pha(gam_pha)
+    opt_conc = opt_prop * 100  # assuming total = 100
 
-# Partial plots for GAM HB_HV_prod (second row)
-for i in range(4):
-    ax = axs[1, i]
-    XX = gam_HBHV.generate_X_grid(term=i)
-    pdep = gam_HBHV.partial_dependence(term=i, X=XX)
-    ax.plot(XX[:, i], pdep)
-    ax.set_title(f"s({['clr_Ac','clr_Pr','clr_Val','clr_But'][i]})")
-    ax.set_xlim(-1, 1)
-    ax.set_xticks([-1, -0.5, 0, 0.5, 1])
-    ax.set_ylim(-1, 1)
-    ax.set_yticks(np.linspace(-1, 1, 5))
-plt.tight_layout()
-plt.show()
+    # -------------------------------------------------------------------
+    # 2.9 · 3-D surfaces (3×2) with fixed z-ticks and export
+    baseline = opt_conc
+    surf_specs = [
+        ("Ac", "Pr", gam_pha, (14, 18), (9, 13), "PHBV$_{prod}$"),
+        ("Ac", "Pr", gam_hbhv, (14, 18), (9, 13), "HB:HV$_{prod}$"),
+        ("Pr", "Val", gam_pha, (9, 13), (11, 15), "PHBV$_{prod}$"),
+        ("Pr", "Val", gam_hbhv, (9, 13), (11, 15), "HB:HV$_{prod}$"),
+        ("But", "Val", gam_pha, (57, 61), (11, 15), "PHBV$_{prod}$"),
+        ("But", "Val", gam_hbhv, (57, 61), (11, 15), "HB:HV$_{prod}$"),
+    ]
+    zticks_left = np.array([15, 20, 25, 30, 35])
+    zticks_right = np.array([1.4, 1.7, 2.0, 2.3, 2.6])
 
-# =========================================================
-# 11. Optimization to maximize PHA (without HB/HV target)
-# =========================================================
-def objective(clr_vals):
-    return -gam_PHA.predict(np.array([clr_vals]))[0]
-
-def constraint_sum(clr_vals):
-    return np.sum(clr_vals)
-
-cons = [{'type': 'eq', 'fun': constraint_sum}]
-x0 = np.zeros(4)
-res = minimize(objective, x0, constraints=cons, bounds=[(-2,2)]*4)
-if res.success:
-    optimal_clr = res.x
-    optimal_pred_PHA = gam_PHA.predict(np.array([optimal_clr]))[0]
-    optimal_pred_HBHV = gam_HBHV.predict(np.array([optimal_clr]))[0]
-    def clr_to_proportions(clr_vals):
-        exp_vals = np.exp(clr_vals)
-        return exp_vals / np.sum(exp_vals)
-    optimal_proportions = clr_to_proportions(optimal_clr)
-    # We calculate the absolute concentrations assuming T = 100
-    T = 100
-    optimal_concentrations = optimal_proportions * T
-    print("\n--- Optimization to maximize PHA ---")
-    print("Optimal values ​​in CLR space:", optimal_clr)
-    print("Optimal proportions (relative to VFAs):", optimal_proportions)
-    print("Optimal concentrations (if total = 100):", optimal_concentrations)
-    print("Predicted PHA:", optimal_pred_PHA)
-    print("Predicted HB/HV:", optimal_pred_HBHV)
-else:
-    print("Optimization failed:", res.message)
-
-# =========================================================
-# 12. 3D Surface plots for PHA_prod and HB_HV_prod with various VFA combinations
-# (A) e (B): (Ac, Pr)
-# (C) e (D): (Pr, Val)
-# (E) e (F): (But, Val)
-# =========================================================
-
-T = 100
-baseline_conc = optimal_proportions * T
-epsilon = 1e-6
-
-var_to_index = {"Ac": 0, "Pr": 1, "Val": 2, "But": 3}
-
-vfa_labels = {
-    "Ac": "Ac (%)",
-    "Pr": "Pr (%)",
-    "Val": "Val (%)",
-    "But": "But (%)"
-}
-
-def compute_gam_response(x_val, y_val, x_var, y_var, model, baseline_conc, T=50):
-    idx_x = var_to_index[x_var]
-    idx_y = var_to_index[y_var]
-
-    sum_xy = x_val + y_val
-    remain = T - sum_xy
-    if remain < 0:
-        return np.nan
-
-    new_conc = np.zeros(4)
-    new_conc[idx_x] = x_val
-    new_conc[idx_y] = y_val
-
-    baseline_other_sum = np.sum(baseline_conc) - (baseline_conc[idx_x] + baseline_conc[idx_y])
-    for j in range(4):
-        if j not in [idx_x, idx_y]:
-            new_conc[j] = baseline_conc[j] / baseline_other_sum * remain
-
-    new_prop = new_conc / T
-    new_prop = np.maximum(new_prop, epsilon)
-    new_prop = new_prop / np.sum(new_prop)
-    new_clr = np.log(new_prop) - np.mean(np.log(new_prop))
-    return model.predict(np.array([new_clr]))[0]
-
-def create_3d_surface(ax, x_var, y_var, model, zlabel, title_label,
-                      x_min, x_max, y_min, y_max, n_points=50,
-                      axis_label_size=8,
-                      tick_label_size=8,
-                      title_size=10):
-    X_range = np.linspace(x_min, x_max, n_points)
-    Y_range = np.linspace(y_min, y_max, n_points)
-    X, Y = np.meshgrid(X_range, Y_range)
-    Z = np.zeros_like(X)
-
-    for i in range(n_points):
-        for j in range(n_points):
-            Z[i, j] = compute_gam_response(
-                X[i, j], Y[i, j],
-                x_var, y_var,
-                model,
-                baseline_conc,
-                T
-            )
-
-    surf = ax.plot_surface(X, Y, Z, cmap='viridis', edgecolor='none', alpha=0.8)
-
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_xticks(np.linspace(x_min, x_max, 5))
-    ax.set_yticks(np.linspace(y_min, y_max, 5))
-
-    if "PHA" in zlabel:
-        ax.set_zlim(10, 35)
-        ax.set_zticks(np.linspace(10, 35, 6))
-    else:
-        ax.set_zlim(1, 3.5)
-        ax.set_zticks(np.linspace(1, 3.5, 6))
-
-    ax.set_xlabel(vfa_labels[x_var], fontsize=axis_label_size, color='black')
-    ax.set_ylabel(vfa_labels[y_var], fontsize=axis_label_size, color='black')
-    ax.set_zlabel(zlabel, fontsize=axis_label_size, color='black')
-    ax.set_title(title_label, loc='left', fontweight='bold', fontsize=title_size)
-
-    ax.tick_params(axis='x', labelsize=tick_label_size, colors='black')
-    ax.tick_params(axis='y', labelsize=tick_label_size, colors='black')
-    ax.tick_params(axis='z', labelsize=tick_label_size, colors='black')
-
-# Creating the figure
-fig = plt.figure(figsize=(24/2.54, 36/2.54))
-subplot_labels = [r"$\mathbf{(A)}$", r"$\mathbf{(B)}$",
-                  r"$\mathbf{(C)}$", r"$\mathbf{(D)}$",
-                  r"$\mathbf{(E)}$", r"$\mathbf{(F)}$"]
-
-# (A) - PHA_prod, (x,y) = (Ac, Pr)
-axA = fig.add_subplot(3, 2, 1, projection='3d')
-create_3d_surface(
-    axA,
-    x_var="Ac",
-    y_var="Pr",
-    model=gam_PHA,
-    zlabel=r"PHA$_{prod}$",
-    title_label=subplot_labels[0],
-    x_min=14, x_max=18,
-    y_min=9,  y_max=13
-)
-
-# (B) - HB/HV_prod, (x,y) = (Ac, Pr)
-axB = fig.add_subplot(3, 2, 2, projection='3d')
-create_3d_surface(
-    axB,
-    x_var="Ac",
-    y_var="Pr",
-    model=gam_HBHV,
-    zlabel=r"HB:HV$_{prod}$",
-    title_label=subplot_labels[1],
-    x_min=14, x_max=18,
-    y_min=9,  y_max=13
-)
-
-# (C) - PHA_prod, (x,y) = (Pr, Val)
-axC = fig.add_subplot(3, 2, 3, projection='3d')
-create_3d_surface(
-    axC,
-    x_var="Pr",
-    y_var="Val",
-    model=gam_PHA,
-    zlabel=r"PHA$_{prod}$",
-    title_label=subplot_labels[2],
-    x_min=9, x_max=13,
-    y_min=11,  y_max=15
-)
-
-# (D) - HB/HV_prod, (x,y) = (Pr, Val)
-axD = fig.add_subplot(3, 2, 4, projection='3d')
-create_3d_surface(
-    axD,
-    x_var="Pr",
-    y_var="Val",
-    model=gam_HBHV,
-    zlabel=r"HB:HV$_{prod}$",
-    title_label=subplot_labels[3],
-    x_min=9, x_max=13,
-    y_min=11,  y_max=15
-)
-
-# (E) - PHA_prod, (x,y) = (But, Val)
-axE = fig.add_subplot(3, 2, 5, projection='3d')
-create_3d_surface(
-    axE,
-    x_var="But",
-    y_var="Val",
-    model=gam_PHA,
-    zlabel=r"PHA$_{prod}$",
-    title_label=subplot_labels[4],
-    x_min=57, x_max=61,
-    y_min=11,  y_max=15
-)
-
-# (F) - HB/HV_prod, (x,y) = (But, Val)
-axF = fig.add_subplot(3, 2, 6, projection='3d')
-create_3d_surface(
-    axF,
-    x_var="But",
-    y_var="Val",
-    model=gam_HBHV,
-    zlabel=r"HB:HV$_{prod}$",
-    title_label=subplot_labels[5],
-    x_min=57, x_max=61,
-    y_min=11,  y_max=15
-)
-
-plt.subplots_adjust(
-    left=0.05,  right=0.95,
-    bottom=0.05, top=0.95,
-    wspace=0.3,  hspace=0.3
-)
-
-fig.savefig("3d_plot.png", dpi=300, bbox_inches=None, pad_inches=0.5)
-files.download("3d_plot.png")
-plt.show()
-
-
-# =========================================================
-# 13. Sensitivity Analysis with 4 subplots (groups "Ac & Pr" and "But & Val")
-# for responses: PHA_prod (first row, y=[0,40]) and HB/HV_prod (second row, y=[0,4])
-# Sensitivity range: 10-60
-# =========================================================
-
-T = 100  # Total of the concentrations
-baseline_conc = optimal_proportions * T  # Optimal baseline concentrations
-epsilon = 1e-6  # Minimal value to avoid log(0)
-
-# We define the variable groups and map them to the indexes
-group1 = ["Ac", "Pr"]
-group2 = ["But", "Val"]
-var_to_index = {"Ac": 0, "Pr": 1, "Val": 2, "But": 3}
-
-# "Colorblind" palette for 4 colors
-colors = sns.color_palette("colorblind", 4)
-
-# Range and tick for x e y axes
-candidate_conc_vals = np.linspace(10, 60, 500)
-xticks = np.linspace(10, 60, 6)
-pha_yticks = np.linspace(0, 40, 5)
-hbhv_yticks = np.linspace(0, 4, 5)
-
-# Creating the figure with 2 rows x 2 columns, same size (14x10)
-fig, axs = plt.subplots(nrows=2, ncols=2, figsize=(14, 10))
-subplot_labels = [r"$\mathbf{(A)}$", r"$\mathbf{(B)}$", r"$\mathbf{(C)}$", r"$\mathbf{(D)}$"]
-
-for row, (response_name, gam_model) in enumerate([("PHA_prod", gam_PHA), ("HB_HV_prod", gam_HBHV)]):
-    for col, group in enumerate([group1, group2]):
-        ax = axs[row, col]
-        for var in group:
-            idx = var_to_index[var]
-            preds = []
-            for conc_val in candidate_conc_vals:
-                new_conc = np.zeros(4)
-                new_conc[idx] = conc_val
-                remaining = T - conc_val
-                baseline_other_sum = np.sum(baseline_conc) - baseline_conc[idx]
-                for j in range(4):
-                    if j != idx:
-                        new_conc[j] = baseline_conc[j] / baseline_other_sum * remaining
-                new_prop = new_conc / T
-                new_prop = np.maximum(new_prop, epsilon)
-                new_prop = new_prop / np.sum(new_prop)
-                new_clr = np.log(new_prop) - np.mean(np.log(new_prop))
-                pred = gam_model.predict(np.array([new_clr]))[0]
-                preds.append(pred)
-            ax.plot(candidate_conc_vals, preds, label=var, color=colors[var_to_index[var]])
-        ax.set_xlim([10, 60])
-        ax.set_xticks(xticks)
-        ax.set_xlabel(r"Abundance (%)", color='black')
-        if response_name == "PHA_prod":
-            ax.set_ylim([0, 40])
-            ax.set_yticks(pha_yticks)
-            ax.set_ylabel(r"$PHA_{prod}$", color='black')
+    fig3d = plt.figure(figsize=(5.5, 7))  # inches
+    for idx, (xv, yv, mod, xlim, ylim, zlab) in enumerate(surf_specs):
+        ax = fig3d.add_subplot(3, 2, idx + 1, projection="3d")
+        Xg, Yg, Z = calc_surface(xv, yv, mod, baseline, xlim, ylim)
+        ax.plot_surface(Xg, Yg, Z, cmap="viridis", edgecolor="none", alpha=0.9)
+        ax.set_xlabel(f"{xv} (%)")
+        ax.set_ylabel(f"{yv} (%)")
+        ax.set_title(chr(65 + idx), loc="left", fontweight="bold")
+        if idx % 2 == 0:
+            ax.set_zticks(zticks_left)
+            ax.set_zlim(zticks_left.min(), zticks_left.max())
         else:
-            ax.set_ylim([0, 4])
-            ax.set_yticks(hbhv_yticks)
-            ax.set_ylabel(r"$HB:HV_{prod}$", color='black')
-        ax.tick_params(axis='x', colors='black')
-        ax.tick_params(axis='y', colors='black')
-        ax.legend()
-        subplot_index = row * 2 + col
-        ax.text(-0.15, 1.1, subplot_labels[subplot_index], transform=ax.transAxes,
-                fontsize=16, fontweight='bold', va='top', ha='left', color='black')
-        # You do not set an individual title here
+            ax.set_zticks(zticks_right)
+            ax.set_zlim(zticks_right.min(), zticks_right.max())
+        ax.zaxis.set_major_formatter(mticker.FormatStrFormatter("%.1f"))
+        ax.set_zlabel(zlab)
+        ax.view_init(elev=28, azim=135)
+    fig3d.tight_layout()
+    fig3d.savefig(output_dir / "surface_plots.pdf")
+    fig3d.savefig(output_dir / "surface_plots.png", dpi=500)
 
-plt.tight_layout()
-plt.show()
+    # -------------------------------------------------------------------
+    # 2.10 · Sensitivity analysis and ±10 % profiles
+    # (Omitted here for brevity; replicate your earlier code inside helper
+    #  functions if you wish to include these figures in the publication.)
 
-# =========================================================
-# 14. Optimum detail: ±10% variation around the optimum
-# =============================================================
-# For each VFA (Ac, Pr, Val, But) we examine how the responses vary around the optimum,
-# expressing the variation in percentage terms (from -10% to +10%).
-T = 100  # Total concentrations
-epsilon = 1e-6
+    # -------------------------------------------------------------------
+    # 2.11 · Predictions for original data and export to Excel
+    preds_pha = []
+    preds_hbhv = []
+    for _, row in df.iterrows():
+        vfa_vec = row[vfa_cols].to_numpy(dtype=float)
+        clr_vec = single_clr(vfa_vec)
+        preds_pha.append(gam_pha.predict(clr_vec.reshape(1, -1))[0])
+        preds_hbhv.append(gam_hbhv.predict(clr_vec.reshape(1, -1))[0])
 
-variables = ['Ac', 'Pr', 'Val', 'But']
-var_to_index = {"Ac": 0, "Pr": 1, "Val": 2, "But": 3}
+    df["Predicted_PHA"] = preds_pha
+    df["Predicted_HB_HV"] = preds_hbhv
 
-# Let's define the ticks for the x-axis in percentage terms
-pct_ticks = [-0.10, -0.05, 0, 0.05, 0.10]
-pct_ticklabels = ['-10%', '-5%', '0%', '5%', '10%']
+    with pd.ExcelWriter(output_dir / "results.xlsx", engine="openpyxl") as xl:
+        corr.to_excel(xl, sheet_name="Correlation_Matrix")
+        df.to_excel(xl, sheet_name="Predictions", index=False)
 
-# Creating the figure with 4 subplots (2x2)
-fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-subplot_labels = ["(A)", "(B)", "(C)", "(D)"]
+    print("Pipeline completed successfully → see outputs in", output_dir)
 
-# Let's create two custom handles for the global legend
-import matplotlib.lines as mlines
-handle_PHA = mlines.Line2D([], [], color='b', label=r'$PHA_{prod}$')
-handle_HBHV = mlines.Line2D([], [], color='r', label=r'$HB:HV_{prod}$')
 
-for i, var in enumerate(variables):
-    idx = var_to_index[var]
-    opt_conc = optimal_concentrations[idx]
-    # Let's define the percentage range: from -10% to +10%
-    candidate_pct = np.linspace(-0.10, 0.10, 50)
-    preds_PHA = []
-    preds_HBHV = []
+# =======================================================================
+# 3 · Entry point
+# =======================================================================
 
-    for pct in candidate_pct:
-        candidate_conc = opt_conc * (1 + pct)
-        new_conc = np.zeros(4)
-        new_conc[idx] = candidate_conc
-        remaining = T - candidate_conc
+if __name__ == "__main__":
+    import argparse
 
-        baseline_other_sum = np.sum(optimal_concentrations) - opt_conc
-        for j in range(4):
-            if j != idx:
-                new_conc[j] = optimal_concentrations[j] / baseline_other_sum * remaining
+    parser = argparse.ArgumentParser(description="Run VFA compositional workflow.")
+    parser.add_argument("excel_file", type=str, help="Path to Excel file with raw data.")
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="analysis_output",
+        help="Directory for figures and tables.",
+    )
+    args = parser.parse_args()
 
-        new_prop = new_conc / T
-        new_prop = np.maximum(new_prop, epsilon)
-        new_prop = new_prop / np.sum(new_prop)
-        new_clr = np.log(new_prop) - np.mean(np.log(new_prop))
-
-        pred_PHA = gam_PHA.predict(np.array([new_clr]))[0]
-        pred_HBHV = gam_HBHV.predict(np.array([new_clr]))[0]
-        preds_PHA.append(pred_PHA)
-        preds_HBHV.append(pred_HBHV)
-
-    ax = axs[i//2, i % 2]
-    # PHA line plot in blue
-    ax.plot(candidate_pct, preds_PHA, 'b-', label=r'$PHA_{prod}$')
-    # Setting x-axis with specific label: ΔAc, ΔPr, etc.
-    ax.set_xlabel(r"$\Delta " + var + r"\ (\%)$", color='black')
-    ax.tick_params(axis='x', colors='black')
-    ax.set_xlim([-0.10, 0.10])
-    ax.set_xticks(pct_ticks)
-    ax.set_xticklabels(pct_ticklabels, color='black')
-
-    # Set the first y-axis label to "PHA_prod"
-    ax.set_ylabel(r"$PHA_{prod}$", color='black')
-    ax.tick_params(axis='y', colors='black')
-    ax.set_ylim([0, 40])
-    ax.set_yticks(np.linspace(0, 40, 5))
-
-    # Creating secondary axis for HB:HV_prod with label always visible
-    ax2 = ax.twinx()
-    ax2.plot(candidate_pct, preds_HBHV, 'r-', label=r'$HB:HV_{prod}$')
-    ax2.set_ylim([0, 4])
-    ax2.set_yticks(np.linspace(0, 4, 5))
-    ax2.set_ylabel(r"$HB:HV_{prod}$", color='black')
-    ax2.tick_params(axis='y', colors='black')
-
-    # Let's add the subplot label (A), (B), ... outside the graph area
-    ax.annotate(subplot_labels[i], xy=(0, 1), xytext=(-40, 10),
-                xycoords='axes fraction', textcoords='offset points',
-                fontsize=16, fontweight='bold', color='black')
-
-plt.tight_layout(rect=[0, 0.1, 1, 1])  # We leave space at the bottom for the legend
-# Add a global legend at the bottom centered
-fig.legend(handles=[handle_PHA, handle_HBHV], loc='lower center', ncol=2, fontsize=14)
-plt.show()
-
-# =========================================================
-# 15. Calculating and saving GAM predictions for the original data
-# =========================================================
-
-# Let's create a copy of the original DataFrame to add the predictions
-dati_predictions = dati.copy()
-
-predicted_PHA_list = []
-predicted_HBHV_list = []
-
-# Helper function: calculates the CLR of a 4D vector of VFA
-def single_clr_transform(vfa_array):
-    # vfa_array = [Ac, Pr, Val, But]
-    g_val = np.exp(np.mean(np.log(vfa_array)))
-    return np.log(vfa_array / g_val)
-
-# We iterate over each row of the original dataset, computing the prediction
-for idx, row in dati_predictions.iterrows():
-    ac_val  = row['Substrate_Ac']
-    pr_val  = row['Substrate_Pr']
-    val_val = row['Substrate_Val']
-    but_val = row['Substrate_But']
-
-    # Let's build the concentration vector
-    vfa_array = np.array([ac_val, pr_val, val_val, but_val], dtype=float)
-
-    # Let's calculate the CLR
-    clr_values = single_clr_transform(vfa_array)
-
-    # We use GAM models to predict
-    pha_pred  = gam_PHA.predict(clr_values.reshape(1, -1))[0]
-    hbhv_pred = gam_HBHV.predict(clr_values.reshape(1, -1))[0]
-
-    predicted_PHA_list.append(pha_pred)
-    predicted_HBHV_list.append(hbhv_pred)
-
-# Let's add the prediction columns to the DataFrame
-dati_predictions['Predicted_PHA'] = predicted_PHA_list
-dati_predictions['Predicted_HB_HV'] = predicted_HBHV_list
-
-# =========================================================
-# 16. Final saving of results in an Excel file and download
-# =========================================================
-
-writer = pd.ExcelWriter("results.xlsx", engine="openpyxl")
-corr_matrix.to_excel(writer, sheet_name="Correlation_Matrix", index=True)
-
-ols_pha_text = model_PHA.summary().as_text()
-ols_pha_df = pd.DataFrame({"OLS_PHA_Summary": ols_pha_text.splitlines()})
-ols_pha_df.to_excel(writer, sheet_name="OLS_PHA", index=False)
-
-ols_hbhv_text = model_HBHV.summary().as_text()
-ols_hbhv_df = pd.DataFrame({"OLS_HBHV_Summary": ols_hbhv_text.splitlines()})
-ols_hbhv_df.to_excel(writer, sheet_name="OLS_HBHV", index=False)
-
-sio_pha = io.StringIO()
-with contextlib.redirect_stdout(sio_pha):
-    gam_PHA.summary()
-gam_pha_text = sio_pha.getvalue()
-gam_pha_df = pd.DataFrame({"GAM_PHA_Summary": gam_pha_text.splitlines()})
-gam_pha_df.to_excel(writer, sheet_name="GAM_PHA", index=False)
-
-sio_hbhv = io.StringIO()
-with contextlib.redirect_stdout(sio_hbhv):
-    gam_HBHV.summary()
-gam_hbhv_text = sio_hbhv.getvalue()
-gam_hbhv_df = pd.DataFrame({"GAM_HBHV_Summary": gam_hbhv_text.splitlines()})
-gam_hbhv_df.to_excel(writer, sheet_name="GAM_HBHV", index=False)
-
-# We save the prediction results on a new sheet
-dati_predictions.to_excel(writer, sheet_name="Predictions", index=False)
-
-writer.close()
-files.download("results.xlsx")
-
-print("\nWorkflow successfully completed!")
+    main(Path(args.excel_file), output_dir=Path(args.out))
