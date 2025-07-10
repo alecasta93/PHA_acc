@@ -1,207 +1,266 @@
-%reset -f
-import pandas as pd
+#!/usr/bin/env python
+# coding: utf-8
+"""
+Network diagram of correlation matrix with cluster-based layout.
+
+Features
+--------
+* Reads correlation matrix (Excel/CSV) + optional Alpha transparency sheet.
+* Keeps only edges |r| > THRESH and involving nodes containing 'D' or 'R'.
+* Manual x-positions for clusters: Input (-2), Process (0), Output (+2).
+* Edge styling by sign & strength; node colour by cluster; node alpha by sheet.
+* Exports high-resolution SVG + PDF.
+
+Author  : <Your Name>
+Created : 2025-07-10
+Python  : ≥3.9
+"""
+
+# ======================================================================
+# 0 · Imports & global settings
+# ======================================================================
+
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
-from google.colab import files
-import re
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
+from matplotlib.patches import FancyArrowPatch  # noqa: F401 (future use)
 
-def format_param(name):
-    """
-   Converts '^' and '_' to LaTeX notation.
-    """
+plt.rcParams.update(
+    {
+        "font.family": "serif",
+        "axes.spines.left": False,
+        "axes.spines.right": False,
+        "axes.spines.top": False,
+        "axes.spines.bottom": False,
+        "figure.dpi": 150,
+    }
+)
+
+THRESH = 0.5  # |r| threshold
+
+
+# ======================================================================
+# 1 · Helper functions
+# ======================================================================
+
+
+def format_param(name: str) -> str:
+    """Convert '^' and '_' into LaTeX-style notation for tick-safe labels."""
     name = re.sub(r"\^(?!{)(\S+)", r"^{\1}", name)
     name = re.sub(r"_(?!{)(\S+)", r"_{\1}", name)
     return f"${name}$"
 
-def manual_layout_by_cluster(nodes, cluster_mapping, x_positions, y_range=(-1, 1)):
-    """
-    Calculate a manual layout by fixing the position of nodes based on their cluster.
 
-    - nodes: list of nodes.
-    - cluster_mapping: dictionary {node: 'Input'/'Process'/'Output'}.
-    - x_positions: dictionary {cluster: x} (e.g. {'Input': -2, 'Process': 0, 'Output': 2}).
-    - y_range: range (min, max) to vertically distribute nodes in each cluster.
-
-    Returns a dictionary {node: (x, y)}.
-    """
-    pos = {}
-    clusters = {}
+def manual_layout(
+    nodes: list[str],
+    clusters: dict[str, str],
+    x_map: dict[str, float] | None = None,
+    y_span: tuple[float, float] = (-1.5, 1.5),
+) -> dict[str, tuple[float, float]]:
+    """Return fixed positions by cluster (alphabetical order within cluster)."""
+    x_map = x_map or {"Input": -2.0, "Process": 0.0, "Output": 2.0}
+    buckets: dict[str, list[str]] = {}
     for n in nodes:
-        # If a node is not present in cluster_mapping, we default it to 'Process'
-        cluster = cluster_mapping.get(n, 'Process')
-        clusters.setdefault(cluster, []).append(n)
-    for cluster, node_list in clusters.items():
-        node_list.sort()  # alphabetical order for reproducibility
-        n = len(node_list)
-        ymin, ymax = y_range
-        if n == 1:
-            ys = [(ymin + ymax) / 2]
-        else:
-            ys = np.linspace(ymax, ymin, n)
-        x = x_positions.get(cluster, 0)
-        for node, y in zip(node_list, ys):
-            pos[node] = (x, y)
+        buckets.setdefault(clusters[n], []).append(n)
+
+    pos: dict[str, tuple[float, float]] = {}
+    for cl, nodelist in buckets.items():
+        nodelist.sort()
+        y_top, y_bot = y_span
+        ys = np.linspace(y_top, y_bot, len(nodelist)) if len(nodelist) > 1 else [
+            np.mean(y_span)
+        ]
+        for y, node in zip(ys, nodelist):
+            pos[node] = (x_map.get(cl, 0.0), y)
     return pos
 
-# ------------------- Loading data -------------------
-print("Upload the file containing the correlation matrix (Excel or CSV):")
-uploaded = files.upload()
-filename = list(uploaded.keys())[0]
 
-# Load correlation matrix from first sheet (default)
-if filename.lower().endswith('.xlsx'):
-    df = pd.read_excel(filename, sheet_name=0, index_col=0)
-elif filename.lower().endswith('.csv'):
-    df = pd.read_csv(filename, index_col=0)
-else:
-    raise ValueError("Format not supported. Use CSV or Excel.")
+def load_matrix(path: Path) -> pd.DataFrame:
+    """Read correlation matrix (first sheet) from Excel/CSV."""
+    if path.suffix.lower() == ".xlsx":
+        return pd.read_excel(path, sheet_name=0, index_col=0)
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path, index_col=0)
+    raise ValueError("Use .xlsx or .csv for correlation matrix")
 
-print("First rows of the correlation matrix:")
-print(df.head())
 
-# Load Alpha values ​​from sheet "Foglio2"
-if filename.lower().endswith('.xlsx'):
-    alpha_df = pd.read_excel(filename, sheet_name="Foglio2", index_col=0)
-    # Make sure the column is called "Alpha"
-else:
-    raise ValueError("CSV file does not support multiple sheets. Use Excel for Alpha values.")
+def load_alpha(path: Path | None, index_like: pd.Index) -> pd.Series:
+    """Load Alpha column; default 0.5 for missing nodes."""
+    if path is None:
+        return pd.Series(0.5, index=index_like, dtype=float)
 
-print("Alpha values ​​(first rows):")
-print(alpha_df.head())
+    if path.suffix.lower() != ".xlsx":
+        raise ValueError("--alpha must be an Excel file with an 'Alpha' column")
 
-# ------------------- Graph construction -------------------
-G = nx.Graph()
-nodes = list(df.index)
-G.add_nodes_from(nodes)
+    alpha_raw = pd.read_excel(path, sheet_name=0, index_col=0)["Alpha"]
+    alpha = alpha_raw.reindex(index_like).fillna(0.5).astype(float)
+    return alpha
 
-# Set threshold to include an arc: |r| > 0.5
-threshold = 0.5
-for i, u in enumerate(nodes):
-    for j in range(i+1, len(nodes)):
-        v = nodes[j]
-        r_val = df.loc[u, v]
-        if abs(r_val) > threshold:
-            G.add_edge(u, v, weight=r_val)
 
-# ------------------- Filtering: Keep only arcs involving D or R -------------------
-for (u, v) in list(G.edges()):
-    if 'D' not in (u, v) and 'R' not in (u, v):
-        G.remove_edge(u, v)
+# ======================================================================
+# 2 · Main routine
+# ======================================================================
 
-# ------------------- Cluster Definition -------------------
-input_nodes = ['S_Ac', 'S_Pr', 'S_Val', 'S_But', 'N_in', 'P_in', 'HB/HV_in', 'PHA_in']
-process_nodes = ['N_uptake', 'P_uptake', 'F/X', 'HB/HV_prod', 'PHA_prod', 'Y_S', 'VP', 'Y_X']
-output_nodes = ['HB/HV_end', 'PHA_end', 'D', 'R', 'ΔT', 'deltaT']
 
-cluster_mapping = {}
-for n in nodes:
-    if n in input_nodes:
-        cluster_mapping[n] = 'Input'
-    elif n in process_nodes:
-        cluster_mapping[n] = 'Process'
-    elif n in output_nodes:
-        cluster_mapping[n] = 'Output'
-    else:
-        cluster_mapping[n] = 'Process'
+def main(mat_path: Path, alpha_path: Path | None, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-# ------------------- Defining fixed positions for clusters -------------------
-x_positions = {'Input': -2, 'Process': 0, 'Output': 2}
-pos_manual = manual_layout_by_cluster(nodes, cluster_mapping, x_positions, y_range=(-1.5, 1.5))
-
-# ------------------- Set node colors based on cluster -------------------
-color_map = {'Input': 'tab:red', 'Process': 'tab:blue', 'Output': 'tab:green'}
-
-# ------------------- Assign transparency (alpha) to nodes from the sheet "Foglio2" -------------------
-node_alpha = {}
-for n in nodes:
-    try:
-        node_alpha[n] = float(alpha_df.loc[n, "Alpha"])
-    except KeyError:
-        # If the node has no defined value, assign a default, for example 0.5
-        node_alpha[n] = 0.5
-
-# ------------------- Graph drawing -------------------
-plt.figure(figsize=(12,9), dpi=300)
-
-# Draw nodes individually to set transparency
-for node in nodes:
-    nx.draw_networkx_nodes(
-        G, pos_manual, nodelist=[node],
-        node_size=2000,
-        node_color=[color_map[cluster_mapping[node]]],
-        edgecolors='black',
-        alpha=node_alpha[node]
+    corr = load_matrix(mat_path)
+    alpha = (
+        load_alpha(alpha_path, corr.index)
+        if alpha_path
+        else load_alpha(mat_path, corr.index)  # try same Excel sheet
     )
 
-nx.draw_networkx_labels(
-    G, pos_manual,
-    labels={n: format_param(n) for n in nodes},
-    font_size=9, font_color='black'
-)
+    # ------------------ build graph ------------------
+    G = nx.Graph()
+    G.add_nodes_from(corr.index)
 
-# Drawing arcs with conditional styles and curves:
-# - If |r| < 0.75, width = 0.1; otherwise, width = 0.5.
-# - If nodes are in "Input" and "Output" clusters, the arc is dashed, otherwise solid.
-for (u, v, d) in G.edges(data=True):
-    r = d['weight']
-    abs_r = abs(r)
-    width = 0.5 if abs_r < 0.75 else 1
-    edge_color = 'tab:blue' if r >= 0 else 'tab:red'
+    for i, u in enumerate(corr.index):
+        for j in range(i + 1, len(corr)):
+            v = corr.index[j]
+            r = corr.loc[u, v]
+            if abs(r) > THRESH:
+                G.add_edge(u, v, weight=r)
 
-    cluster_u = cluster_mapping[u]
-    cluster_v = cluster_mapping[v]
-    if cluster_u != cluster_v and set([cluster_u, cluster_v]) == {'Input', 'Output'}:
-        style = 'dashed'
-    else:
-        style = 'solid'
+    # keep only edges involving D or R
+    for u, v in list(G.edges()):
+        if "D" not in (u, v) and "R" not in (u, v):
+            G.remove_edge(u, v)
 
-    nx.draw_networkx_edges(
-        G, pos_manual, edgelist=[(u, v)],
-        width=width,
-        edge_color=edge_color,
-        style=style,
-        connectionstyle='arc3, rad=0.2',
-        alpha=1
+    # ------------------ cluster mapping ------------------
+    input_nodes = {
+        "S_Ac",
+        "S_Pr",
+        "S_Val",
+        "S_But",
+        "N_in",
+        "P_in",
+        "HB/HV_in",
+        "PHA_in",
+    }
+    process_nodes = {
+        "N_uptake",
+        "P_uptake",
+        "F/X",
+        "HB/HV_prod",
+        "PHA_prod",
+        "Y_S",
+        "VP",
+        "Y_X",
+    }
+    output_nodes = {"HB/HV_end", "PHA_end", "D", "R", "ΔT", "deltaT"}
+
+    cluster = {}
+    for n in G.nodes:
+        if n in input_nodes:
+            cluster[n] = "Input"
+        elif n in process_nodes:
+            cluster[n] = "Process"
+        elif n in output_nodes:
+            cluster[n] = "Output"
+        else:
+            cluster[n] = "Process"
+
+    colours = {"Input": "tab:red", "Process": "tab:blue", "Output": "tab:green"}
+    pos = manual_layout(list(G.nodes), cluster)
+
+    # ------------------ plot ------------------
+    fig, ax = plt.subplots(figsize=(6, 4.5), dpi=300)
+    ax.axis("off")
+
+    # nodes
+    for n in G.nodes:
+        ax.scatter(
+            *pos[n],
+            s=1200,
+            color=colours[cluster[n]],
+            edgecolor="black",
+            alpha=alpha[n],
+            zorder=3,
+        )
+        ax.text(
+            *pos[n],
+            format_param(n),
+            ha="center",
+            va="center",
+            fontsize=8.5,
+            color="black",
+            zorder=4,
+        )
+
+    # edges
+    for u, v, d in G.edges(data=True):
+        r = d["weight"]
+        lw = 0.5 if abs(r) < 0.75 else 1.0
+        ecolor = "tab:blue" if r >= 0 else "tab:red"
+        cu, cv = cluster[u], cluster[v]
+        style = "dashed" if {cu, cv} == {"Input", "Output"} else "solid"
+        nx.draw_networkx_edges(
+            G,
+            pos,
+            ax=ax,
+            edgelist=[(u, v)],
+            width=lw,
+            edge_color=ecolor,
+            style=style,
+            connectionstyle="arc3,rad=0.2",
+            alpha=1.0,
+        )
+
+    # legend
+    legend_elems = [
+        Line2D([0], [0], marker="o", color="w", markeredgecolor="black", label="Input", markerfacecolor=colours["Input"], markersize=9),
+        Line2D([0], [0], marker="o", color="w", markeredgecolor="black", label="Process", markerfacecolor=colours["Process"], markersize=9),
+        Line2D([0], [0], marker="o", color="w", markeredgecolor="black", label="Output", markerfacecolor=colours["Output"], markersize=9),
+        Line2D([0], [0], color="tab:blue", lw=2, label="r > 0"),
+        Line2D([0], [0], color="tab:red",  lw=2, label="r < 0"),
+        Line2D([0], [0], color="black", lw=2, linestyle="dashed", label="Input–Output"),
+        Line2D([0], [0], color="black", lw=2, linestyle="solid",  label="Other links"),
+    ]
+    ax.legend(
+        handles=legend_elems,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.08),
+        ncol=4,
+        fontsize=7,
+        frameon=False,
     )
 
-# ------------------- Creating the legend -------------------
-# We create lines and patches to explain the colors of the nodes and arcs
-legend_elements = [
-    # Nodes (circles)
-    Line2D([0], [0], marker='o', color='w', label='Input',
-           markerfacecolor='tab:red', markeredgecolor='black',
-           markersize=10),
-    Line2D([0], [0], marker='o', color='w', label='Process',
-           markerfacecolor='tab:blue', markeredgecolor='black',
-           markersize=10),
-    Line2D([0], [0], marker='o', color='w', label='Output',
-           markerfacecolor='tab:green', markeredgecolor='black',
-           markersize=10),
+    # save
+    svg_path = out_dir / "network_diagram.svg"
+    pdf_path = out_dir / "network_diagram.pdf"
+    fig.savefig(svg_path, format="svg", bbox_inches="tight")
+    fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
+    print(f"✔ Diagram saved → {svg_path.name}, {pdf_path.name}")
 
-    # Arcs for positive/negative correlations
-    Line2D([0], [0], color='tab:blue', lw=2, label='r > 0'),
-    Line2D([0], [0], color='tab:red', lw=2, label='r < 0'),
 
-    # Dashed vs solid style
-    Line2D([0], [0], color='black', lw=2, linestyle='dashed', label='Input–Output'),
-    Line2D([0], [0], color='black', lw=2, linestyle='solid', label='Input–Process/Process–Output')
-]
+# ======================================================================
+# 3 · CLI
+# ======================================================================
 
-plt.legend(
-    handles=legend_elements,
-    loc='lower center',          
-    bbox_to_anchor=(0.5, -0.05), 
-    ncol=3,                      
-    fontsize=8
-)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Correlation network diagram")
+    parser.add_argument("matrix", type=str, help="Correlation matrix (.xlsx / .csv)")
+    parser.add_argument(
+        "--alpha",
+        type=str,
+        help="Optional Excel with 'Alpha' column for node transparency",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="fig_output",
+        help="Output directory for figures",
+    )
+    args = parser.parse_args()
 
-plt.axis('off')
-
-# Save the figure as SVG and start downloading
-plt.savefig("network_diagram.svg", format="svg", bbox_inches="tight")
-from google.colab import files
-files.download("network_diagram.svg")
-plt.show()
+    main(Path(args.matrix), Path(args.alpha) if args.alpha else None, Path(args.out))
