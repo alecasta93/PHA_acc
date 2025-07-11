@@ -90,13 +90,13 @@ Each script builds an output folder (PDF, SVG, PNG, LaTeX/CSV/XLSX tables) and p
 ## 5 · Citing this repository
 
 ```bibtex
-@software{Castagnoli_2025_VFA,
+@software{Castagnoli_2025_PHA_acc,
   author    = {Castagnoli, Alessio},
   title     = {Impact of VFA Composition on PHBV Production and Properties in Mixed Microbial Cultures},
   year      = {2025},
   publisher = {Zenodo},
-  doi       = {10.5281/zenodo.1234567},
-  url       = {https://doi.org/10.5281/zenodo.1234567}
+  doi       = {10.5281/zenodo.15861684},
+  url       = {https://doi.org/10.5281/zenodo.15861683}
 }
 ```
 
