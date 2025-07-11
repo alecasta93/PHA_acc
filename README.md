@@ -16,3 +16,18 @@ pygam>=0.9           # pre-built wheels for CPython 3.9-3.12
 
 # --- Excel I/O ---------------------------------------------------
 openpyxl>=3.1        # pandas ≥ 2.x no longer bundles older openpyxl
+
+
+Installation for the network diagram
+# --- Core scientific stack ---------------------------------------
+numpy>=1.24
+pandas>=2.2          # needs numpy ≥ 1.24
+
+# --- Graph construction & plotting -------------------------------
+networkx>=3.2        # 3.x requires Python ≥ 3.9
+matplotlib>=3.8      # networkx 3.x ↔ matplotlib ≥ 3.5
+
+# --- Excel I/O ----------------------------------------------------
+openpyxl>=3.1        # required only when reading .xlsx matrices / alpha sheet
+
+
